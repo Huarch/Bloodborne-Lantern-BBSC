@@ -1,0 +1,10 @@
+{
+  "serverHost": "example.invalid",
+  "ports": { "shadnet": 31313, "webApi": 31315, "gameApi": 20443, "relay": 20444, "udp": 31314, "stun": 3478 },
+  "registrationKey": "",
+  "gameRoot": "",
+  "accountFile": "",
+  "supportedLanternVersion": "0.9.37",
+  "supportedProbeSize": 44788224,
+  "multiplayerRelay": true
+}

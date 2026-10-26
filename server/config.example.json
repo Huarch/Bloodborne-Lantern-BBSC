@@ -1,0 +1,12 @@
+{
+  "publicAddress": "203.0.113.10",
+  "bindAddress": "0.0.0.0",
+  "registrationKey": "REPLACE_WITH_A_RANDOM_SECRET",
+  "admins": [],
+  "ports": { "shadnet": 31313, "webApi": 31315, "gameApi": 20443, "relay": 20444, "udp": 31314, "stun": 3478, "bbhost": 18671 },
+  "paths": { "shadnetBinary": "build/shadnet", "runtime": "runtime", "qtLibraryPath": "" },
+  "summonInterval": 5,
+  "relaySessionRouting": true,
+  "notice": "欢迎归来，猎人\n愿良善之血指引你的道路。",
+  "bbhost": { "enabled": true, "relayPorts": "24000-24999", "heartbeatTimeout": 30 }
+}

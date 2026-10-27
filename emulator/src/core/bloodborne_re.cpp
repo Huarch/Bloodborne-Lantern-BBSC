@@ -3937,6 +3937,8 @@ constexpr s64 BbscSpectateReleaseDebounceMs = 1'500;
 constexpr s64 BbscSpectateSafetyMs = 15 * 60 * 1'000;
 
 bool bbsc_spectate_active = false;
+std::atomic<bool> bbsc_spectate_hooks_ready{false};
+std::atomic<bool> bbsc_death_tick_ready{false};
 bool bbsc_spectate_releasing = false;
 std::string_view bbsc_spectate_name;
 // The death step's own StageTransition call is retargeted to a no-op (Group::Spectate), so BBSC
@@ -8563,7 +8565,8 @@ bool BbscLateDeathStep(std::string_view name) {
 // a no-op, so nothing is skipped here: this only records that the local player died so the tick
 // below can revive them (or wait out a boss fight first).
 void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* registers) {
-    if (registers == nullptr || bbsc_spectate_releasing || !BbscSpectateEnabled()) {
+    if (registers == nullptr || bbsc_spectate_releasing || !BbscSpectateEnabled() ||
+        !BbscDeathReloadReady()) {
         return; // releasing: the reload the step asked for is being requested for real
     }
     const std::string_view name = tag == 0 ? "SoloPlayDeath_2" : "PartyGhostDeath_2";
@@ -8597,7 +8600,7 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
     ObserveBbscDeathCycle();
     const bool guest_waits_for_host = session_state == 6 && !LivingPartnerExists() &&
                                       !bbsc_respawn_at_boss_entrance;
-    if (!guest_waits_for_host && !LivingPartnerExists()) {
+    if (!guest_waits_for_host && !LivingPartnerExists() && !bbsc_respawn_at_boss_entrance) {
         // No partner: ask for the reload the retargeted call site no longer performs, so a solo
         // death still ends the way the game intends.
         LOG_INFO(Debug, "BBSC spectate: {} runs normally (no living partner)", name);
@@ -15324,6 +15327,7 @@ void InstallBbscSpectateHooks() {
     }
     LOG_INFO(Debug, "BBSC spectate enabled (SoloPlayDeath_2 {:#x}, PartyGhostDeath_2 {:#x})",
              SoloPlayDeathFinalOffset, PartyGhostDeathFinalOffset);
+    bbsc_spectate_hooks_ready.store(true);
     InstallBbscBossClearHooks();
 }
 
@@ -17189,6 +17193,10 @@ void BbscTimelineEvent(std::string_view kind, std::string_view text) {
     BbscTimeline(kind, text);
 }
 
+bool BbscDeathReloadReady() {
+    return bbsc_spectate_hooks_ready.load() && bbsc_death_tick_ready.load();
+}
+
 // ---- Message and bloodstain lists (2026-10-18) ---------------------------------------------------
 // Reports (valriv55, greatinvs host+guest, aau2, yoshiyukirose, shacoringa, emirya, ansemtv66):
 // "[Dantelion2 Panic] (null)(265) Transaction failed" at Father Gascoigne / Cathedral Ward, host and
@@ -17979,6 +17987,7 @@ void InstallReverseEngineeringTrace() {
             (deferred_summon_reload_hook_installed && site.offset == SosStatusUpdateOffset) ||
             (healing_fountain_host_availability_hook_installed &&
              site.offset == HealingFountainAvailabilityOffset)) {
+            if (site.offset == BbscGameTickOffset) bbsc_death_tick_ready.store(true);
             ++hook_count;
             continue;
         }
@@ -17989,6 +17998,7 @@ void InstallReverseEngineeringTrace() {
                       site.offset);
             continue;
         }
+        if (site.offset == BbscGameTickOffset) bbsc_death_tick_ready.store(true);
         ++hook_count;
     }
 

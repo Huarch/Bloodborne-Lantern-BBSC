@@ -54,6 +54,8 @@ void NoteBbscHostRangOurSign(std::uint32_t sender);
 std::int32_t GetBbscRelaySessionState();
 void InstallSeamlessCoopPatches();
 void InstallReverseEngineeringTrace();
+// The DLL must keep vanilla death reloads until both callbacks and the game tick exist.
+bool BbscDeathReloadReady();
 
 // BBSC Discord status: what the game is doing, gathered once a second on the game tick.
 struct BbscPresence {

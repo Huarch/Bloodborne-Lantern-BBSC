@@ -284,6 +284,7 @@ bool Wanted(const Site& s) {
     if (!GroupEnabled(s.group)) {
         return false;
     }
+    if (s.group == Group::Spectate && !Core::Bloodborne::BbscDeathReloadReady()) return false;
     if (IsRoleGroup(s.group)) {
         return role_on;
     }
@@ -540,6 +541,13 @@ DWORD WINAPI Worker(void*) {
     BBSC_TIMELINE("START", "Image verified after {} ms: {} byte patch sites written", verified, written);
 
     Core::Bloodborne::InstallReverseEngineeringTrace();
+    {
+        std::scoped_lock lock{patch_mutex};
+        SyncSites(); // only now may the installed callbacks take ownership of death reloads
+    }
+    if (!Core::Bloodborne::BbscDeathReloadReady()) {
+        LOG_WARNING(Mod, "BBSC death hooks incomplete; ordinary solo death reload remains enabled");
+    }
     BbscMod::StartRelay();
     BbscMod::StartP2PChannel();
     BbscMod::InstallHttpWrappers();

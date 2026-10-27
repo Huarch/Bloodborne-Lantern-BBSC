@@ -10,6 +10,8 @@
 
 普通死亡重载仅在两个死亡回调和游戏循环均就绪后才由 BBSC 接管。未加入联机房间时继续使用普通单人重生；初始化失败也不再提前屏蔽普通死亡重载。
 
+代码页写入权限在 Lantern 原生初始化完成后准备，避免等待期间代码页改为只读后，BBSC 写入补丁触发 `0xc0000005`。当前编译和启动权限回归测试通过，最新修订仍需实际启动与联机复测。
+
 ## 配置入口
 
 | 部分 | 唯一手动配置文件 | 模板 |
@@ -32,6 +34,16 @@
 把 `bbsc.dll`、`bbsc-launch.exe` 放到 `client/bbsc/`；该目录还需 `emulator/mod/mod.json`，根目录的 LICENSE（命名为 LICENSE.txt）、NOTICE.md（命名为 NOTICE.txt）、CREDITS.txt、SUPPORTERS.txt。账号注册程序 `shadnet-sample.exe` 的源码在 `server/shadnet/clientsample/`，按其 CMakeLists 单独构建后放到 `client/account-helper/`。可复用合法取得的同版辅助程序；本仓库只提交源码。
 
 填写 `client/config.json` 后运行 `client/PLAY LANTERN + BBSC.cmd`。首次启动注册独立账号，以后复用 Windows 加密凭据。Lantern 引擎、画面设置和存档路径继续由 Lantern 管理，**存档默认与主游戏共用**。更新前完整退出游戏；同队玩家使用配套版本。
+
+公开完整客户端位于 GitHub Releases，不含游戏或 Lantern。解压后向服主取得服务器地址和注册密钥，填写包内唯一的 `config.json`；公开包不会预置私人服务器配置。已有玩家更新时保留 `work` 和账号文件，并将旧配置迁移至 `config.json`。
+
+构建后运行以下命令生成公开 ZIP。打包脚本只收集明确列出的文件，配置从占位模板生成，包含账号注册工具和许可说明；不读取已安装客户端中的真实配置、账号、日志或存档。带私人服务器配置的受邀分发包不能作为公开 Release 附件上传。
+
+```sh
+python package-client.py --account-helper /path/to/account-helper
+```
+
+默认输出 `build/releases/Bloodborne-Lantern-BBSC.zip`，可用 `--output` 指定路径，`--binaries` 指定 DLL 与注入启动器所在目录。压缩包只放在 Release 附件，不提交到 Git 历史。
 
 ## 服务端构建与启动
 

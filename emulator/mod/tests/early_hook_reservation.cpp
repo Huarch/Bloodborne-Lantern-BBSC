@@ -47,6 +47,35 @@ int main() {
         assert(end > at); at = end;
     }
     assert(Core::PrepareGuestHookArea()); // reuse, no second allocation in the now-full window
+
+    // Reproduce the startup fault: native initialization changes initially writable code
+    // to RX after trampoline reservation, so the shared seamless installer cannot memcpy it.
+    auto* bell_page = image + 0x0157f000;
+    assert(VirtualAlloc(bell_page, 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    assert(VirtualAlloc(image + 0x1000, 0x1000, MEM_COMMIT, PAGE_READONLY));
+    DWORD old = 0;
+    assert(VirtualProtect(image, 0x1000, PAGE_EXECUTE_READ, &old));
+    assert(VirtualProtect(bell_page, 0x1000, PAGE_EXECUTE_READ, &old));
+    MEMORY_BASIC_INFORMATION before{};
+    assert(VirtualQuery(image + 0x0157f8cc, &before, sizeof(before)));
+    assert(before.Protect == PAGE_EXECUTE_READ);
+    assert(Core::PrepareGuestCodeWrites(Base, ImageSize)); // runs after native completion
+    MEMORY_BASIC_INFORMATION data{};
+    assert(VirtualQuery(image + 0x1000, &data, sizeof(data)));
+    assert(data.Protect == PAGE_READONLY); // unrelated data retains its protection
+    MEMORY_BASIC_INFORMATION after{};
+    assert(VirtualQuery(image + 0x0157f8cc, &after, sizeof(after)));
+    assert(after.Protect == PAGE_EXECUTE_READWRITE);
+    const u8 patch[] = {0x0f, 0x8f, 0x90, 0x00, 0x00, 0x00};
+    std::memcpy(image + 0x0157f8c8, patch, sizeof(patch)); // exact faulting patch range
+    assert(std::memcmp(image + 0x0157f8c8, patch, sizeof(patch)) == 0);
+    assert(!Core::PrepareGuestCodeWrites(0, ImageSize));
+    assert(!Core::PrepareGuestCodeWrites(Base, 0));
+    assert(VirtualProtect(bell_page, 0x1000, PAGE_EXECUTE_READ | PAGE_GUARD, &old));
+    assert(!Core::PrepareGuestCodeWrites(Base, ImageSize)); // fail closed on guarded code
+    assert(VirtualProtect(bell_page, 0x1000, PAGE_EXECUTE_READWRITE, &old));
+    std::cout << "LATE_CODE_PERMISSIONS_REGRESSION_OK\n";
+
     assert(Core::InstallGuestCodeHook(image, prologue, 0, Observe, nullptr));
     assert(image[0] == 0xe9);
     s32 jump = 0; std::memcpy(&jump, image+1, 4);

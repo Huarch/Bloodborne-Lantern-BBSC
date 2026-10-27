@@ -474,31 +474,6 @@ DWORD WINAPI Worker(void*) {
         return 0;
     }
     LOG_INFO(Mod, "BBSC trampoline memory reserved before native initialization; no game hooks written yet");
-    // shadPS4 maps the game's code writable; other hosts (bbhost) keep it read-only, and the
-    // shared hook code writes some code bytes directly. Make the image's code writable like shadPS4.
-    {
-        int unlocked = 0;
-        MEMORY_BASIC_INFORMATION info{};
-        u64 at = EbootBase;
-        while (at < EbootBase + EbootSize &&
-               VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) != 0) {
-            const u64 next = reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize;
-            if (info.State == MEM_COMMIT &&
-                (info.Protect == PAGE_EXECUTE_READ || info.Protect == PAGE_EXECUTE)) {
-                DWORD old = 0;
-                const u64 end = std::min<u64>(next, EbootBase + EbootSize);
-                if (VirtualProtect(info.BaseAddress, end - reinterpret_cast<u64>(info.BaseAddress),
-                                   PAGE_EXECUTE_READWRITE, &old)) {
-                    ++unlocked;
-                }
-            }
-            at = next;
-        }
-        if (unlocked != 0) {
-            LOG_INFO(Mod, "Game code made writable ({} region(s)) - this host maps it read-only",
-                     unlocked);
-        }
-    }
     const Site* bad = nullptr;
     while (!AllSitesKnown(&bad)) {
         if (GetTickCount() - started > WaitForImageMs) {
@@ -521,6 +496,14 @@ DWORD WINAPI Worker(void*) {
         Sleep(100); // Features::Install commits the other native hooks after Cheats::Install.
         LOG_INFO(Mod, "Lantern cheat initialization finished before BBSC game hooks");
     }
+    // Reserving trampolines must happen early, but code permissions must be prepared late.
+    // Lantern finalizes the loaded code as RX during native initialization. Doing this before
+    // the cheat-ready wait leaves the seamless installer's direct writes targeting RX pages.
+    if (!Core::PrepareGuestCodeWrites(EbootBase, EbootSize)) {
+        LOG_ERROR(Mod, "BBSC startup stopped: game code could not be made writable after native initialization");
+        return 0;
+    }
+    LOG_INFO(Mod, "BBSC game code permissions prepared after native initialization");
     const DWORD verified = GetTickCount() - started;
 
     MemoryPatcher::g_eboot_address = EbootBase;

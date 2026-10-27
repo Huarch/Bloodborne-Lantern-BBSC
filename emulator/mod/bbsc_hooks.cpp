@@ -19,7 +19,9 @@
 #include <windows.h>
 
 #include <cstddef>
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <mutex>
 
 #include <xbyak/xbyak.h>
@@ -135,6 +137,33 @@ bool WriteJump(u8* site, const void* target, size_t length) {
 bool PrepareGuestHookArea() {
     std::scoped_lock lock{hook_mutex};
     return CheckArea();
+}
+
+bool PrepareGuestCodeWrites(std::uintptr_t image, std::size_t size) {
+    if (!image || !size || size > std::numeric_limits<std::uintptr_t>::max() - image) {
+        return false;
+    }
+    const auto end = image + size;
+    for (auto at = image; at < end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info))) return false;
+        const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (next <= at) return false;
+        const auto stop = std::min(next, end);
+        const auto protection = info.Protect & 0xff;
+        if (info.State == MEM_COMMIT &&
+            (protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+             protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY)) {
+            if (info.Protect & PAGE_GUARD) return false;
+            if (protection != PAGE_EXECUTE_READWRITE && protection != PAGE_EXECUTE_WRITECOPY) {
+                DWORD previous = 0;
+                if (!VirtualProtect(reinterpret_cast<void*>(at), stop - at,
+                                    PAGE_EXECUTE_READWRITE, &previous)) return false;
+            }
+        }
+        at = stop;
+    }
+    return true;
 }
 
 bool InstallGuestCodeHook(void* address, std::span<const u8> expected_instructions, u64 tag,

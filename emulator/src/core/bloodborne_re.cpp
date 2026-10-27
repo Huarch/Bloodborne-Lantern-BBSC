@@ -41,6 +41,7 @@
 #include "core/bbsc_memscan.h"
 #include "core/bbsc_persistence.h"
 #include "core/bbsc_cinematic.h"
+#include "core/bbsc_respawn_state.h"
 #include "imgui/bbsc_loading_layer.h"
 #include "core/cpu_patches.h"
 #include "core/debugger.h"
@@ -3985,6 +3986,8 @@ constexpr s64 BbscWipeHostSettleMs = 2'000; // let the host's synced position se
 // while the guest was down saw a wipe and a reload, even if it never saw "nobody alive" itself
 // (test 2026-10-06: the guest died while the dead host was already reloading).
 u32 bbsc_spectate_revivals_at_death = 0;
+Core::Bbsc::Respawn::DeathCycle bbsc_death_cycle;
+bool bbsc_respawn_at_boss_entrance = false;
 
 bool BbscSpectateEnabled() {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_SPECTATE");
@@ -4140,9 +4143,20 @@ s32 GetSessionState() {
     return ReadablePointer(multi_play, 0x128) ? ReadValue<s32>(multi_play, 0x124) : -1;
 }
 
+u64 GetLocalPlayerCharacter();
+bool BbscBossFightAtDeath();
+void ObserveBbscDeathCycle() {
+    const auto state = GetSessionState();
+    if (state != 3 && state != 6) return;
+    const auto hp = GetCharacterHp(GetLocalPlayerCharacter());
+    if (hp == 0 || bbsc_spectate_active || bbsc_death_cycle.active) {
+        if (!bbsc_death_cycle.active) bbsc_respawn_at_boss_entrance = BbscBossFightAtDeath();
+        bbsc_death_cycle.Observe(bbsc_peer_revivals.load(), BbscAllPartnersReportDead());
+    }
+}
+
 // ---- Seamless Co-op death rules (ER / DS3 / DSR) ------------------------------------------------
-//  * Boss fight (a boss health bar is up) + partner alive: spectate until the boss dies (then
-//    respawn in place) or nobody is left alive (then the normal reload for everyone).
+//  * Boss fight: revive at the pre-fog checkpoint, even when both hunters died.
 //  * No boss fight + partner alive: respawn at your last lamp WITHOUT a reload; the world is not
 //    reset and the partner keeps playing.
 //  * Nobody left alive: the game's normal death reload.
@@ -4255,6 +4269,46 @@ std::optional<BbscTransform> ReadCharacterTransform(u64 chr) {
         return std::nullopt;
     }
     return transform;
+}
+
+std::optional<Core::Bbsc::Respawn::Destination> bbsc_boss_entrance;
+void TickBbscBossEntrance() {
+    static std::vector<Core::Bbsc::Respawn::EntranceSample> history;
+    static s64 last_ms = 0, seen_boss_ms = 0;
+    static bool in_fight = false;
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 250) return;
+    last_ms = now;
+    const auto global = GetGlobalState();
+    if (!ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0) {
+        history.clear();
+        return;
+    }
+    const auto map = GetCurrentPackedMap();
+    const bool boss = BossFightActive();
+    if (boss) {
+        if (!in_fight) {
+            bbsc_boss_entrance = Core::Bbsc::Respawn::EntranceBeforeFight(history, now, map);
+            if (bbsc_boss_entrance) {
+                const auto& p = *bbsc_boss_entrance;
+                LOG_INFO(Debug, "BBSC boss entrance: pre-fog checkpoint in map {:#x} at ({:.2f}, {:.2f}, {:.2f})",
+                         p.map, p.x, p.y, p.z);
+                BBSC_TIMELINE("BOSS", "boss entrance checkpoint saved in map {:#x} at ({:.2f}, {:.2f}, {:.2f})",
+                              p.map, p.x, p.y, p.z);
+            }
+            in_fight = true;
+        }
+        seen_boss_ms = now;
+        return;
+    }
+    if (in_fight && now - seen_boss_ms < 10'000) return;
+    in_fight = false;
+    if (GetCharacterHp(GetLocalPlayerCharacter()) <= 0 || bbsc_spectate_active) return;
+    const auto transform = ReadCharacterTransform(GetLocalPlayerCharacter());
+    if (!transform) return;
+    const auto& p = transform->position;
+    history.push_back({now, {map, p[0], p[1], p[2], transform->rotation[1]}});
+    std::erase_if(history, [now](const auto& sample) { return now - sample.ms > 15'000; });
 }
 
 u64 GetLocalPlayerCharacter() {
@@ -4511,8 +4565,25 @@ bool BbscWarpJoinEnabled() {
 // home map. That was wrong: they are the forced placement the game spawns a summoned player from,
 // and without them the reload used the map's default spawn - the guest appeared in Iosefka's
 // Clinic for a moment before the join teleport moved her (Eryk, 2026-09-23, build 732ABF1E).
-bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std::string_view why) {
-    if (!ReadablePointer(global, 0x1598) || !IsUsablePackedMap(to.packed_region)) {
+struct BbscSessionReload {
+    Core::Bbsc::Respawn::Destination to;
+    s64 requested_ms = 0;
+    s64 ready_ms = 0;
+    unsigned attempt = 0;
+    bool active = false;
+};
+std::mutex bbsc_session_reload_mutex;
+BbscSessionReload bbsc_session_reload;
+
+bool BbscSessionReloadPending() {
+    std::scoped_lock lock{bbsc_session_reload_mutex};
+    return bbsc_session_reload.active;
+}
+
+bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std::string_view why,
+                            unsigned attempt = 1) {
+    if (!ReadablePointer(global, 0x1598) || !IsUsablePackedMap(to.packed_region) ||
+        ReadValue<u8>(global, 0x08) != 0) {
         return false;
     }
     if (!WriteTransportedSummonPlacement(global, to)) {
@@ -4542,6 +4613,17 @@ bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std
     if (ReadablePointer(rules, 0x88) && HasMemoryAccess(rules + 0x84, 4, MemoryProt::CpuWrite)) {
         WriteValue<s32>(rules, 0x84, 3);
     }
+    // The corpse's +0x1522 death flag makes StageFlow recompute the map from +0x1528 (the
+    // guest's home lamp), even though SelectSummonedPlacement just chose the host's map.
+    // This is an explicit summoned transition; its descriptor is pinned below as well.
+    if (!HasMemoryAccess(global + 0x1522, 2, MemoryProt::CpuWrite)) return false;
+    WriteValue<u8>(global, 0x1522, 0);
+    WriteValue<u8>(global, 0x1523, 0);
+    {
+        std::scoped_lock lock{bbsc_session_reload_mutex};
+        bbsc_session_reload = {{to.packed_region, to.x, to.y, to.z, to.heading},
+                               SteadyNowMs(), 0, attempt, true};
+    }
     StartBbscLoadCover(why); // already on for the summon when this is the cross-map second reload
     const u64 result = reinterpret_cast<StageTransition>(image_base + StageTransitionOffset)();
     LOG_INFO(Debug,
@@ -4549,6 +4631,62 @@ bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std
              "result {}",
              why, to.packed_region, to.x, to.y, to.z, result);
     return true;
+}
+
+void PinBbscSessionReloadDescriptor(const GuestRegisterSnapshot& registers) {
+    std::scoped_lock lock{bbsc_session_reload_mutex};
+    if (!bbsc_session_reload.active ||
+        SteadyNowMs() - bbsc_session_reload.requested_ms > 45'000 ||
+        !HasMemoryAccess(registers.r9, 0x88, MemoryProt::CpuWrite)) return;
+    const auto old_map = ReadValue<u32>(registers.r9, 8);
+    const auto old_type = ReadValue<s32>(registers.r9, 0x54);
+    Core::Bbsc::Respawn::PinDescriptor(
+        {reinterpret_cast<u8*>(registers.r9), 0x88}, bbsc_session_reload.to);
+    if (old_map != bbsc_session_reload.to.map || old_type != 2) {
+        LOG_INFO(Debug, "BBSC session reload: descriptor map {:#x} type {} -> host map {:#x}, "
+                        "absolute summon placement", old_map, old_type, bbsc_session_reload.to.map);
+        BBSC_TIMELINE("LOAD", "session reload: descriptor corrected from map {:#x} type {} to {:#x}",
+                      old_map, old_type, bbsc_session_reload.to.map);
+    }
+}
+
+void TickBbscSessionReload() {
+    BbscSessionReload copy;
+    const auto global = GetGlobalState();
+    const auto now = SteadyNowMs();
+    {
+        std::scoped_lock lock{bbsc_session_reload_mutex};
+        if (!bbsc_session_reload.active) return;
+        if (now - bbsc_session_reload.requested_ms > 45'000 ||
+            (GetSessionState() == 0 && now - bbsc_session_reload.requested_ms > 3'000)) {
+            bbsc_session_reload.active = false;
+            EndBbscLoadCover("session reload timed out or session ended");
+            return;
+        }
+        if (!ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0 ||
+            !IsSprjLuaEventManReady() || GetLocalPlayerCharacter() == 0) {
+            bbsc_session_reload.ready_ms = 0;
+            return;
+        }
+        if (bbsc_session_reload.ready_ms == 0) bbsc_session_reload.ready_ms = now;
+        if (now - bbsc_session_reload.ready_ms < 3'000) return;
+        if (GetCurrentPackedMap() == bbsc_session_reload.to.map) {
+            bbsc_session_reload.active = false;
+            return;
+        }
+        copy = bbsc_session_reload;
+        bbsc_session_reload.active = false;
+    }
+    LOG_WARNING(Debug, "BBSC session reload: arrived in {:#x}, wanted {:#x} (attempt {})",
+                GetCurrentPackedMap(), copy.to.map, copy.attempt);
+    if (copy.attempt >= 3) {
+        EndBbscLoadCover("session reload destination unavailable after three attempts");
+        return;
+    }
+    SummonPlacementDescriptor to{};
+    to.packed_region = copy.to.map;
+    to.x = copy.to.x; to.y = copy.to.y; to.z = copy.to.z; to.heading = copy.to.heading;
+    RequestBbscSessionWarp(global, to, "recovery", copy.attempt + 1);
 }
 
 void TickBbscJoinTeleport() {
@@ -4892,6 +5030,7 @@ void TickBbscFollowHost() {
         return;
     }
     last_check_ms = now;
+    if (BbscSessionReloadPending()) return; // the owned load must settle before another warp
 
     const u64 global = GetGlobalState();
     if (GetSessionState() != 6 || !ReadablePointer(global, 0x1598) ||
@@ -7360,7 +7499,7 @@ bool BbscLampBlockLoaded(s32 point) {
     if (map == 0 || !IsUsablePackedMap(map)) {
         return true;
     }
-    return map == GetCurrentPackedMap() || BbscMapResident(map);
+    return Core::Bbsc::Respawn::CoordinatesUsable(GetCurrentPackedMap(), map, BbscMapResident(map));
 }
 
 // a4_ns 2026-10-14: revived at the host's lamp, died again 36 ms later (the game's kill reward
@@ -7428,13 +7567,32 @@ bool BbscRespawnInPlace(std::string_view why) {
     const bool guest = ReadablePointer(global, 0x1593) && ReadValue<u8>(global, 0x1592) == 0;
     std::optional<BbscTransform> target;
     std::string_view where = "last lamp";
+    if (bbsc_respawn_at_boss_entrance && bbsc_boss_entrance &&
+        Core::Bbsc::Respawn::CoordinatesUsable(GetCurrentPackedMap(), bbsc_boss_entrance->map,
+                                             BbscMapResident(bbsc_boss_entrance->map))) {
+        const auto& p = *bbsc_boss_entrance;
+        target = BbscTransform{{p.x, p.y, p.z, 1}, {0, p.heading, 0, 0}};
+        where = "boss fog entrance";
+    }
+    if (bbsc_respawn_at_boss_entrance && !target.has_value()) {
+        if (const auto body = ReadCharacterTransform(player)) {
+            s32 point = -1;
+            target = ResolveNearestLoadedLamp(body->position, &point);
+            if (target && !BbscLampBlockLoaded(point)) target.reset();
+            where = "safe lamp (boss entrance not recorded)";
+        }
+        if (!target) {
+            LOG_WARNING(Debug, "BBSC boss respawn: no pre-fog checkpoint or safe lamp; using a real death reload");
+            return false; // never put a dead hunter back inside the arena or at another stage's coordinates
+        }
+    }
     // Testers 2026-10-07: "when the host is in a different area when the guest respawns, the area
     // the host is in is not loaded and guests fall through the map". Beside-the-host used the host
     // character's position, which is in the coordinates of the host's map - not loaded here, so
     // nothing under the guest. The host's position is used only while the host's map is loaded
     // here; otherwise the nearest lamp of OUR map, and the follow then reloads us into the host's.
     bool partner_here = !guest;
-    if (guest) {
+    if (!target.has_value() && guest) {
         s32 host_lamp = -1;
         u32 host_map = 0;
         {
@@ -7445,7 +7603,8 @@ bool BbscRespawnInPlace(std::string_view why) {
             }
         }
         partner_here = IsUsablePackedMap(host_map) &&
-                       (host_map == GetCurrentPackedMap() || BbscMapResident(host_map));
+                       Core::Bbsc::Respawn::CoordinatesUsable(
+                           GetCurrentPackedMap(), host_map, BbscMapResident(host_map));
         if (host_lamp != -1 && !BbscLampBlockLoaded(host_lamp)) {
             LOG_INFO(Debug, "BBSC respawn: host's lamp {} is in map {:#x}, not loaded here - "
                             "skipped",
@@ -7466,7 +7625,7 @@ bool BbscRespawnInPlace(std::string_view why) {
                 where = "partner";
             }
         }
-    } else {
+    } else if (!target.has_value()) {
         target = ResolveLastLampTransform();
     }
     if (!target.has_value()) {
@@ -8435,7 +8594,9 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
         bbsc_request_death_reload = true;
         return;
     }
-    const bool guest_waits_for_host = session_state == 6 && !LivingPartnerExists();
+    ObserveBbscDeathCycle();
+    const bool guest_waits_for_host = session_state == 6 && !LivingPartnerExists() &&
+                                      !bbsc_respawn_at_boss_entrance;
     if (!guest_waits_for_host && !LivingPartnerExists()) {
         // No partner: ask for the reload the retargeted call site no longer performs, so a solo
         // death still ends the way the game intends.
@@ -8455,10 +8616,14 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
     bbsc_spectate_saw_wipe = guest_waits_for_host;
     bbsc_spectate_wipe_warped = false;
     bbsc_spectate_host_back_ms = 0;
-    bbsc_spectate_revivals_at_death = bbsc_peer_revivals.load();
+    ObserveBbscDeathCycle();
+    bbsc_spectate_revivals_at_death = bbsc_death_cycle.active
+        ? bbsc_death_cycle.revivals_at_start : bbsc_peer_revivals.load();
+    bbsc_spectate_saw_wipe |= bbsc_death_cycle.saw_wipe;
     bbsc_boss_cleared_since_ms = 0;
-    bbsc_death_mode = BbscBossFightAtDeath() || guest_waits_for_host ? BbscDeathMode::Spectate
-                                                                      : BbscDeathMode::RespawnNow;
+    bbsc_death_mode = bbsc_respawn_at_boss_entrance ? BbscDeathMode::RespawnNow
+        : (guest_waits_for_host || bbsc_spectate_saw_wipe ? BbscDeathMode::Spectate
+                                                       : BbscDeathMode::RespawnNow);
     bbsc_spectate_active = true;
     if (guest_waits_for_host) {
         LOG_INFO(Debug, "BBSC death: {} with nobody alive (guest) -> wait for the host's reload, "
@@ -8468,13 +8633,30 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
     }
     LOG_INFO(Debug, "BBSC death: {} without reload (session state {}, partner alive) -> {}", name,
              session_state,
-             bbsc_death_mode == BbscDeathMode::Spectate
-                 ? "boss fight: spectate until the boss dies or nobody is alive"
-                 : "no boss fight: respawn at the last lamp without a reload");
+             bbsc_respawn_at_boss_entrance ? "respawn outside the boss fog (last lamp if no checkpoint)"
+             : bbsc_death_mode == BbscDeathMode::Spectate ? "wait for the host's reload after a wipe"
+                                                       : "respawn at the last lamp without a reload");
 }
 
 // Game-thread tick: release the held death once nobody is left alive, the session is over, or the
 // safety limit is reached.
+void TickBbscDeathCycle() {
+    if (GetSessionState() != 3 && GetSessionState() != 6) {
+        if (!BbscSessionReloadPending()) {
+            bbsc_death_cycle.Reset();
+            bbsc_respawn_at_boss_entrance = false;
+        }
+        return;
+    }
+    if (GetCharacterHp(GetLocalPlayerCharacter()) > 0 && !bbsc_spectate_active &&
+        !BbscCurtainActive() && !BbscSessionReloadPending()) {
+        bbsc_death_cycle.Reset();
+        bbsc_respawn_at_boss_entrance = false;
+    } else {
+        ObserveBbscDeathCycle();
+    }
+}
+
 void TickBbscSpectate() {
     NoteBbscBossBar();
     RestoreBbscOwnWorldSnapshot();
@@ -8489,6 +8671,8 @@ void TickBbscSpectate() {
     const s64 now = SteadyNowMs();
     const s32 session_state = GetSessionState();
     const bool session_alive = session_state == 3 || session_state == 6;
+    if (BbscSessionReloadPending()) return; // no revival/teleport into an unfinished stage
+    bbsc_spectate_saw_wipe |= bbsc_death_cycle.saw_wipe;
     std::string_view reason;
     if (session_state == 6 && !bbsc_spectate_saw_wipe &&
         bbsc_boss_killed_ms < bbsc_spectate_since_ms &&
@@ -8497,11 +8681,11 @@ void TickBbscSpectate() {
         LOG_INFO(Debug, "BBSC spectate: a partner said dead and then alive while we were down - "
                         "it reloaded after a wipe, the guest follows");
     }
-    if (session_alive && LivingPartnerExists()) {
+    if (session_alive && (LivingPartnerExists() || bbsc_respawn_at_boss_entrance)) {
         std::string_view respawn_why;
         const u64 chr = GetLocalPlayerCharacter();
         if (bbsc_death_mode == BbscDeathMode::RespawnNow) {
-            respawn_why = "no boss fight";
+            respawn_why = bbsc_respawn_at_boss_entrance ? "boss fog entrance" : "no boss fight";
         } else if (chr != 0 && bbsc_spectate_chr != 0 && chr != bbsc_spectate_chr) {
             respawn_why = "a load ended the boss fight";
         } else if (session_state == 6 && bbsc_spectate_saw_wipe && !bbsc_spectate_wipe_warped) {
@@ -8514,26 +8698,26 @@ void TickBbscSpectate() {
             if (now - bbsc_spectate_host_back_ms < BbscWipeHostSettleMs) {
                 return;
             }
-            bbsc_spectate_wipe_warped = true;
-            const u64 real_host = FindRemoteHostCharacter();
-            const u64 host = real_host != 0 && GetCharacterHp(real_host) > 0
-                                 ? real_host
-                                 : FindLivingPartnerCharacter();
-            const auto host_transform = ReadCharacterTransform(host);
-            if (host_transform.has_value()) {
+            BbscFollowMessage host{};
+            {
+                std::scoped_lock lock{bbsc_follow_mutex};
+                host = bbsc_follow_latest;
+            }
+            if (host.received_ms && now - host.received_ms <= BbscFollowStaleMs &&
+                IsUsablePackedMap(host.packed_map)) {
                 SummonPlacementDescriptor to{};
-                to.packed_region = GetCurrentPackedMap();
-                to.x = host_transform->position[0] + 1.0f;
-                to.y = host_transform->position[1];
-                to.z = host_transform->position[2];
-                to.heading = host_transform->rotation[1];
+                to.packed_region = host.packed_map;
+                to.x = host.x + 1.0f;
+                to.y = host.y;
+                to.z = host.z;
+                to.heading = host.heading;
                 if (RequestBbscSessionWarp(GetGlobalState(), to, "wipe")) {
+                    bbsc_spectate_wipe_warped = true;
                     return; // the load builds a new character: "a load ended the boss fight"
                 }
             }
-            LOG_WARNING(Debug, "BBSC spectate: wipe reload could not be requested, respawning "
-                               "in place instead");
-            respawn_why = "the host reloaded after the wipe";
+            if (now - bbsc_spectate_host_back_ms < BbscGuestWaitHostMs) return;
+            reason = "host returned but no usable host destination arrived";
         } else if (bbsc_boss_killed_ms >= bbsc_spectate_since_ms) {
             if (bbsc_boss_cleared_since_ms == 0) {
                 bbsc_boss_cleared_since_ms = now;
@@ -12192,7 +12376,11 @@ void TickBbscLifeBroadcast() {
         bbsc_life_own_id = player_id;
     }
     const u64 player = GetLocalPlayerCharacter();
-    const bool dead = bbsc_spectate_active || (player != 0 && GetCharacterHp(player) <= 0);
+    const u64 global = GetGlobalState();
+    const bool loading = !ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0 ||
+                         !IsSprjLuaEventManReady() || BbscSessionReloadPending();
+    const bool dead = Core::Bbsc::Respawn::ReportDead(
+        last_dead, bbsc_spectate_active, player ? GetCharacterHp(player) : -1, loading);
     struct {
         u8 magic[4] = {'S', 'H', 'A', 'D'};
         u8 type = 0x23;
@@ -13166,6 +13354,7 @@ void PS4_SYSV_ABI BbscDeathStepTraceHook(u64 tag, const GuestRegisterSnapshot* r
              Names[tag], GetSessionState(), GetLocalPlayerType(),
              ReadValue<u8>(GetGlobalState(), 0x1592), GetBloodEchoes());
     if (tag == 0 || tag == 2) {
+        ObserveBbscDeathCycle(); // capture the partner's state before the final death animation
         bbsc_death_script_ms = SteadyNowMs();
     }
     if (tag == 2) {
@@ -13402,7 +13591,7 @@ void TickBbscDeadWatchdog() {
         return;
     }
     bbsc_dead_since_ms = 0;
-    if (repeat && BbscBossFightAtDeath() && LivingPartnerExists()) {
+    if (repeat && BbscBossFightAtDeath() && LivingPartnerExists() && !bbsc_respawn_at_boss_entrance) {
         // Same rule as the death step: in a boss fight the dead player waits for the boss kill or
         // for nobody to be left alive (TickBbscSpectate).
         bbsc_spectate_name = "repeat death";
@@ -16010,6 +16199,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         ApplyCrossMapSummonGuestPlacement(*registers);
     }
     if (summon_reload_state_hook_installed && site.offset == StageWarpDescriptorFinalizeOffset) {
+        PinBbscSessionReloadDescriptor(*registers);
         ApplySummonReloadStateAtDescriptor(*registers);
     }
     if (site.offset == 0x0178D9C0) {
@@ -16059,6 +16249,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscOwnWorld();
         TickBbscEchoCounter();
         TickBbscSharedProgress();
+        TickBbscBossEntrance();
+        TickBbscDeathCycle();
+        TickBbscSessionReload();
         TickBbscSpectate();
         TickBbscFollowBroadcast();
         TickBbscWorldFlagsBroadcast();

@@ -13,4 +13,6 @@ clang-cl %FLAGS% /LD "%SRC%\bbsc_mod.cpp" "%SRC%\bbsc_hooks.cpp" "%SRC%\bbsc_rel
 clang-cl %FLAGS% "%SRC%\bbsc_launch.cpp" /Fo"%OBJ%\\" /Fe"%OUT%\bbsc-launch.exe" /link user32.lib comdlg32.lib /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup || exit /b 1
 clang-cl /nologo /std:c++17 /EHsc "%SRC%\tests\multiplayer_readiness.cpp" /Fo"%OBJ%\\" /Fe"%OUT%\readiness-test.exe" || exit /b 1
 "%OUT%\readiness-test.exe" || exit /b 1
+clang-cl /nologo /std:c++20 /EHsc "%SRC%\tests\respawn_regressions.cpp" /Fo"%OBJ%\\" /Fe"%OUT%\respawn-test.exe" || exit /b 1
+"%OUT%\respawn-test.exe" || exit /b 1
 echo Build complete: %OUT%

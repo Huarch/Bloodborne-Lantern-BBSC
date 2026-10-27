@@ -40,6 +40,7 @@
 #include "core/bbsc_cinematic.h"
 #include "core/bbsc_patch_tables.h"
 #include "core/bloodborne_re.h"
+#include "lantern_cheats.h"
 
 // One line in this run's BBSC timeline (bloodborne_re.cpp, "Timeline").
 #define BBSC_TIMELINE(kind, ...) Core::Bloodborne::BbscTimelineEvent(kind, fmt::format(__VA_ARGS__))
@@ -79,6 +80,8 @@ HMODULE self_module = nullptr;
 std::filesystem::path mod_dir;
 FILE* log_file = nullptr;
 std::mutex log_mutex;
+const volatile u8* lantern_cheats_ready = nullptr;
+u8* lantern_cheats_shared = nullptr;
 
 void OpenLog() {
     wchar_t path[MAX_PATH]{};
@@ -305,6 +308,78 @@ int SyncSites() {
     return count;
 }
 
+// Opted in by the Lantern launcher bridge. Preserve the native settings/hot reload and only
+// override its online-disable predicate in this process; the engine file stays original.
+void PreserveLanternCheats() {
+    char enabled[8]{};
+    if (!GetEnvironmentVariableA("BBSC_LANTERN_CHEATS", enabled, sizeof(enabled)) || enabled[0] != '1') return;
+    auto* module = reinterpret_cast<u8*>(GetModuleHandleW(nullptr));
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 0x100000) return;
+    auto* pe = reinterpret_cast<const IMAGE_NT_HEADERS64*>(module + dos->e_lfanew);
+    if (pe->Signature != IMAGE_NT_SIGNATURE || pe->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return;
+    std::optional<size_t> match;
+    auto* sections = IMAGE_FIRST_SECTION(pe);
+    const std::span<const u8> image{module, pe->OptionalHeader.SizeOfImage};
+    for (unsigned i = 0; i < pe->FileHeader.NumberOfSections; ++i) {
+        const auto& section = sections[i];
+        if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const auto found = BbscMod::Lantern::CheatGate(image, section.VirtualAddress,
+            static_cast<size_t>(section.VirtualAddress) + section.Misc.VirtualSize);
+        if (!found) continue;
+        if (match) { LOG_WARNING(Mod, "Lantern cheats: ambiguous native gate; unchanged"); return; }
+        match = found;
+    }
+    if (!match) { LOG_WARNING(Mod, "Lantern cheats: native gate not recognized; unchanged"); return; }
+    // The native cheat verifier must see the original game functions before BBSC installs
+    // its GameParam.Goods.Lookup trace hook. Resolve Tick's own installed flag from its
+    // unwind range, rather than relying on a startup sleep or bypassing that verifier.
+    const auto directory = pe->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (directory.VirtualAddress < image.size() && directory.Size <= image.size() - directory.VirtualAddress) {
+        const auto* functions = reinterpret_cast<const IMAGE_RUNTIME_FUNCTION_ENTRY*>(module + directory.VirtualAddress);
+        for (unsigned i = 0; i < pe->FileHeader.NumberOfSections; ++i) {
+            const auto& section = sections[i];
+            if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+            const size_t end = std::min<size_t>(image.size(), section.VirtualAddress + section.Misc.VirtualSize);
+            for (size_t at = section.VirtualAddress; at + 5 < end; ++at) {
+                if (module[at] != 0xe8) continue;
+                s32 displacement = 0;
+                std::memcpy(&displacement, module + at + 1, 4);
+                if (static_cast<s64>(at + 5) + displacement != static_cast<s64>(*match)) continue;
+                if (at + 11 < end && module[at+5] == 0x88 && module[at+6] == 0x05) {
+                    std::memcpy(&displacement, module + at + 7, 4);
+                    const auto cached = static_cast<s64>(at + 11) + displacement;
+                    if (cached >= 0 && static_cast<u64>(cached) < image.size()) lantern_cheats_shared = module + cached;
+                }
+                for (size_t f = 0; f < directory.Size / sizeof(*functions); ++f) {
+                    const auto& fn = functions[f];
+                    if (at < fn.BeginAddress || at >= fn.EndAddress) continue;
+                    for (size_t p = fn.BeginAddress; p + 7 < std::min<size_t>(fn.EndAddress, fn.BeginAddress + 160); ++p) {
+                        if (module[p] != 0x80 || module[p+1] != 0x3d || module[p+6] != 1) continue;
+                        std::memcpy(&displacement, module + p + 2, 4);
+                        const auto flag = static_cast<s64>(p + 7) + displacement;
+                        if (flag >= 0 && static_cast<u64>(flag) < image.size()) lantern_cheats_ready = module + flag;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (!lantern_cheats_ready) {
+        LOG_WARNING(Mod, "Lantern cheats: native initialization handshake not recognized; unchanged");
+        return;
+    }
+    DWORD previous = 0;
+    if (!VirtualProtect(module + *match, 3, PAGE_EXECUTE_READWRITE, &previous)) return;
+    const u8 allow_settings[] = {0x31, 0xc0, 0xc3}; // SharedWorld initializer returns false
+    std::memcpy(module + *match, allow_settings, sizeof(allow_settings));
+    FlushInstructionCache(GetCurrentProcess(), module + *match, sizeof(allow_settings));
+    DWORD ignored = 0;
+    VirtualProtect(module + *match, 3, previous, &ignored);
+    if (lantern_cheats_shared) *lantern_cheats_shared = 0;
+    LOG_INFO(Mod, "Lantern cheats: native Lantern settings retained for this BBSC session");
+}
+
 // ---- Start-up ------------------------------------------------------------------------------------
 
 // LICENSE.txt (the GPL) and NOTICE.txt (copyright + source link) ship in the mod folder so a copy
@@ -351,6 +426,7 @@ DWORD WINAPI Worker(void*) {
     }
     LOG_INFO(Mod, "BBSC mod in pid {} ({})", GetCurrentProcessId(),
              Common::FS::PathToUTF8String(std::filesystem::path{exe}));
+    PreserveLanternCheats();
     // Public servers (2026-10-11, shadNet's author: The Hunter's Dream is exact to the official
     // server, custom summon behaviour does not work there). Wozzardman's seamless summon patches
     // (cross-map sign search, host-placement summon build) and the 5-hunter search patches change
@@ -428,6 +504,16 @@ DWORD WINAPI Worker(void*) {
         Sleep(1);
     }
     Sleep(SettleMs);
+    if (lantern_cheats_ready) {
+        const auto wait_start = GetTickCount();
+        while (*lantern_cheats_ready != 1 && GetTickCount() - wait_start < 15'000) Sleep(10);
+        if (*lantern_cheats_ready != 1) {
+            LOG_ERROR(Mod, "Lantern cheat initialization did not finish; BBSC hooks not installed");
+            return 0;
+        }
+        Sleep(100); // Features::Install commits the other native hooks after Cheats::Install.
+        LOG_INFO(Mod, "Lantern cheat initialization finished before BBSC game hooks");
+    }
     const DWORD verified = GetTickCount() - started;
 
     MemoryPatcher::g_eboot_address = EbootBase;

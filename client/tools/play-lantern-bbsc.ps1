@@ -385,6 +385,7 @@ $oldDlssDir = $env:BB_DLSS_DIR
 $oldP2pChannel = $env:SHADPS4_BBSC_P2P_CHANNEL
 $oldGameRelay = $env:BBSC_GAME_RELAY
 $oldMultiplayerRelay = $env:BBSC_MULTIPLAYER_RELAY
+$oldLanternCheats = $env:BBSC_LANTERN_CHEATS
 try {
     $env:PATH = "$outDir;$oldPath"
     $env:BB_CONFIG = $config
@@ -402,6 +403,7 @@ try {
     $env:BB_USER_NAME = [string]$account.name
     $env:BBSC_RELAY = "${connectAddress}:${relayPort}"
     $env:BBSC_MOD_SEAMLESS = '1'
+    $env:BBSC_LANTERN_CHEATS = '1'
     # The addressed mod channel owns game-facing endpoint translation; keep the old
     # optional peer channel disabled. Lantern's native signaling is left intact.
     $env:SHADPS4_BBSC_P2P_CHANNEL = '0'
@@ -446,5 +448,6 @@ try {
     $env:SHADPS4_BBSC_P2P_CHANNEL = $oldP2pChannel
     $env:BBSC_GAME_RELAY = $oldGameRelay
     $env:BBSC_MULTIPLAYER_RELAY = $oldMultiplayerRelay
+    $env:BBSC_LANTERN_CHEATS = $oldLanternCheats
     Restore-StagedFiles $paths
 }

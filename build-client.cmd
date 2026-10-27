@@ -15,4 +15,6 @@ clang-cl /nologo /std:c++17 /EHsc "%SRC%\tests\multiplayer_readiness.cpp" /Fo"%O
 "%OUT%\readiness-test.exe" || exit /b 1
 clang-cl /nologo /std:c++20 /EHsc "%SRC%\tests\respawn_regressions.cpp" /Fo"%OBJ%\\" /Fe"%OUT%\respawn-test.exe" || exit /b 1
 "%OUT%\respawn-test.exe" || exit /b 1
+clang-cl %FLAGS% "%SRC%\tests\early_hook_reservation.cpp" "%SRC%\bbsc_hooks.cpp" /Fo"%OBJ%\\" /Fe"%OUT%\hook-reservation-test.exe" || exit /b 1
+"%OUT%\hook-reservation-test.exe" || exit /b 1
 echo Build complete: %OUT%

@@ -25,6 +25,7 @@
 #include <xbyak/xbyak.h>
 
 #include "core/cpu_patches.h"
+#include "bbsc_hooks.h"
 
 namespace BbscMod {
 void LogPlain(const char* text);
@@ -130,6 +131,11 @@ bool WriteJump(u8* site, const void* target, size_t length) {
 }
 
 } // namespace
+
+bool PrepareGuestHookArea() {
+    std::scoped_lock lock{hook_mutex};
+    return CheckArea();
+}
 
 bool InstallGuestCodeHook(void* address, std::span<const u8> expected_instructions, u64 tag,
                           GuestCodeHook hook, const u8* skip_flag) {

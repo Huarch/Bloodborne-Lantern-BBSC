@@ -41,6 +41,7 @@
 #include "core/bbsc_patch_tables.h"
 #include "core/bloodborne_re.h"
 #include "lantern_cheats.h"
+#include "bbsc_hooks.h"
 
 // One line in this run's BBSC timeline (bloodborne_re.cpp, "Timeline").
 #define BBSC_TIMELINE(kind, ...) Core::Bloodborne::BbscTimelineEvent(kind, fmt::format(__VA_ARGS__))
@@ -467,6 +468,11 @@ DWORD WINAPI Worker(void*) {
     }
     LOG_INFO(Mod, "Game image found at {:#x}{}", EbootBase,
              EbootBase == ForkEbootBase ? "" : " (not the shadp2p fork's address)");
+    if (!Core::PrepareGuestHookArea()) {
+        LOG_ERROR(Mod, "BBSC startup stopped: cannot reserve trampoline memory before native initialization");
+        return 0;
+    }
+    LOG_INFO(Mod, "BBSC trampoline memory reserved before native initialization; no game hooks written yet");
     // shadPS4 maps the game's code writable; other hosts (bbhost) keep it read-only, and the
     // shared hook code writes some code bytes directly. Make the image's code writable like shadPS4.
     {
